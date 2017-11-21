@@ -32,10 +32,61 @@ type commImpl struct {
 	msgPublisher	*ChannelDeMultiplexer
 	lock			*sync.RWMutex
 	lsnr			net.Listener
-	gSrv			*grpc.WaitGroup
+	gSrv			*grpc.Server
+	exitChan		chan struct{}
+	stopWG 			*grpc.WaitGroup 
 	subscriptions	[]chan proto.ReceivedMessage
 	port 			int
 	stopping 		int32
 }
 ```
+
+# commImpl属性介绍
+
+## 身份相关属性
+
+- selfCertHash: 指的是节点tls证书的SHA256哈希
+
+- peerIdentity: 指节点的证书
+
+- PKIID：指节点的pki-id
+
+- idMapper: 存储了pki-id到证书的映射
+
+## 连接相关属性
+
+- opts：grpc连接选项
+
+- secureDialOpts: grpc安全连接选项
+
+- connStore：存储了与此节点进行的连接，即存储了从pki-id到连接的映射
+
+- deadEndpoints: 断开的节点的一个通道
+
+- lsnr：peer节点的监听器
+
+- gSrc：grpc服务
+
+- port：端口
+
+## 多通道相关属性
+
+- msgPublisher：通道的多路选择器，将消息路由到正确的通道中
+
+- subscriptions：传输向channel订阅的消息的通道
+
+# 构造方法及相关方法
+
+## NewCommInstance方法
+
+NewCommInstance新建一个comm实例，并把自己绑定到给定的gRPC服务器上
+
+参数：
+- s *grpc.Server: 绑定的gRPC服务器
+- cert tls.Certificate: tls证书
+- idStore identity.Mapper: 
+
+## NewCommInstanceWithServer
+
+- 
 
