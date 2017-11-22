@@ -75,18 +75,92 @@ type commImpl struct {
 
 - subscriptions：传输向channel订阅的消息的通道
 
-# 构造方法及相关方法
+# 构造及相关方法
 
 ## NewCommInstance方法
 
 NewCommInstance新建一个comm实例，并把自己绑定到给定的gRPC服务器上
 
 参数：
+
 - s *grpc.Server: 绑定的gRPC服务器
 - cert tls.Certificate: tls证书
-- idStore identity.Mapper: 
+- idStore identity.Mapper: 存储pki-id到identity的映射
+- peerIdentity api.PeerIdentity: peer的身份
+- secureDialOpts api.PeerSecureDialOpts: 返回一个grpc.DialOpts的函数
+- dialOpts ...grpc.DialOption: grpc的连接选项
 
-## NewCommInstanceWithServer
+返回值：
 
-- 
+- Comm：Comm实例
+- error
 
+NewCommInstance方法首先从获取peer.gossip.dialTimeout参数，并添加到dialOpts对象中；
+
+然后调用NewCommInstanceWithServer方法创建一个Comm实例；
+
+如果tlscert不为空且有证书，将Comm实例的selfCertHash设置为cert.Certificate[0]的SHA256哈希；
+
+最后将Comm实例绑定到grpc服务器上
+
+```golang
+proto.RegisterGossipServer(s, commInst.(*commImpl))
+```
+
+## NewCommInstanceWithServer方法
+
+创建一个Comm实例
+
+如果dialOpts的长度为0，将peer.gossip.dialTimeout参数添加到dialOpts；
+
+如果port大于0，调用createGRPCLayer方法，创建一个grpc服务器；
+
+创建一个commImpl对象；
+
+调用newConnStore方法创建connStore对象，添加到commImpl对象的属性中；
+
+如果port大于0，将commImpl对象的stopWG等待组加1。新建线程启动服务器，线程结束时，stopWG减1。在原来线程调用proto.RegisterGossipServer(s, commInst)将comm对象绑定到grpc服务器上。
+
+## createGRPCLayer方法
+
+createGRPCLayer方法创建grpc服务器。
+
+参数：
+
+- port int：监听地址
+
+返回值：
+
+- *grpc.Server: grpc服务器
+- net.Listener: 监听器
+- api.PeerSecureDialOpts: 节点的安全连接选项
+- []byte: tlscert哈希
+
+首先，调用本模块的crypto.go文件中的GenerateCertificatesOrPanic方法获取tls.Certificate，并将证书进行SHA256哈希，得到certHash；
+
+初始化tlsConf，并将其添加到serverOpts和dialOpts
+
+```golang
+tlsConf := &tls.Config{
+	Certificates: []tls.Certificate{cert},
+	ClientAuth: tls.RequestClientCert,
+	InsecureSkipVerify: true,
+}
+serverOpts = append(serverOpts, grpc.Creds(credentials.NewTLS(tlsConf)))
+```
+
+```golang
+ta := credentials.NewTLS(&tls.Config{
+	Certificates: []tls.Certificate{cert},
+	InsecureSkipVerify: true,
+})
+dialOpts = append(dialOpts, grpc.WithTransportCredentials(ta))
+```
+
+然后监听tcp端口，ll, err = net.Listen("tcp", listenAddress)
+
+最后创建grpc服务器，s = grpc.NewServer(serverOpts...)
+
+# commImpl对象的普通方法
+
+## 
