@@ -227,3 +227,63 @@ type connectionStore struct {
 ## 普通方法
 
 ### getConnection方法
+
+根据peer获取连接，如果pki2Conn中存在此连接，直接返回；否则，新建一个连接。
+
+参数：
+
+- peer *RemotePeer: 远端节点
+
+返回值：
+
+- *connection
+- error
+
+### connNum方法
+
+返回连接的数量
+
+### closeConn方法
+
+关闭连接
+
+### shutdown方法
+
+关闭
+
+```golang
+wg := sync.WaitGroup{}
+for _, conn := range connections2Close {
+	wg.Add(1)
+	go func(conn *connection) {
+		cs.closeByPKIid(conn.pkiID)
+		wg.Done()
+	} (conn)
+	wg.Wait()
+}
+```
+
+### onConnected方法
+
+在连接时，进行的动作
+
+参数：
+
+- serverStream proto.Gossip_GossipStreamServer
+- connInfo *proto.ConnectionInfo
+
+返回值：
+
+- *connection
+
+如果连接存在，则关闭连接
+
+调用cs.registerConn方法注册连接
+
+### registerConn方法
+
+注册连接。即新建连接，初始化连接中的各个属性
+
+### closeByPKIid方法
+
+根据pkiID关闭连接
