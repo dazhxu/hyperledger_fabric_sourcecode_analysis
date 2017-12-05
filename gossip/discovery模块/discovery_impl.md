@@ -209,6 +209,228 @@ go d.handlePresumedDeadPeers()
 
 ### validateSelfConfig方法
 
-校验自身的配置
+校验自身的配置。主要是校验endpoint的格式
 
+### periodicalSendAlive方法
 
+周期性的发送保活消息。首先调用d.createAliveMessage(true)新建一个alive消息，然后调用d.comm.Gossip(msg)将消息gossip出去
+
+### createAliveMessage方法
+
+新建alive消息。
+
+参数：
+
+- includeInternalEndpoint bool: 是否包含内部endpoint
+
+返回值：
+
+- *proto.SignedGossipMessage
+- error
+
+首先，将d.seqNum加一；然后创建一个GossipMessage.
+
+```golang
+msg2Gossip := &proto.GossipMessage{
+	Tag: proto.GossipMessage_EMPTY,
+	Content: &proto.GossipMessage_AliveMessage{
+		AliveMsg: &proto.AliveMessage{
+			Membership: &proto.Member{
+				Endpoint: endpoint,
+				Metadata: metadata,
+				PkiId: pkiID,
+			},
+			TimestampL &proto.PeerTime{
+				IncNum:uint64(d.incTime),
+				SeqNum: seqNum,
+			},
+		}
+	}
+}
+```
+
+然后调用CryptoService的SignMessage方法对消息进行签名，创建SignedGossipMessage
+
+```golang
+envp := d.crypt.SignMessage(msg2Gossip, internalEndpoint)
+...
+SignedMsg := &proto.SignedGossipMessage{
+	GossipMessage: msg2Gossip,
+	Envelope: envp,
+}
+if !includeInternalEndpoint {
+	signedMsg.Envelope.SecretEnvelop = nil
+}
+return signedMsg, nil
+```
+
+### periodicalCheckAlive方法
+
+周期检查存活节点。
+
+首先调用d.getDeadMembers方法获取失联的存活节点，然后调用expireDeadMembers方法检查失联节点活性
+
+### getDeadMembers方法
+
+获取失联节点的pkiID
+
+返回值：
+
+- []common.PKIidType: 失联节点的pkiID
+
+对于aliveLastTS中的每个条目，获取从最近可见的时间，计算失联的时间长度。如果失联的实际长度大于getAliveExpirationTime获得的时间，则认为节点失联，将其PKIid加入dead数组中。返回。
+
+### expireDeadMember方法
+
+使失联节点失效
+
+参数：
+
+- dead []common.PKIidType
+
+将deadMember从aliveLastTS移到deadLastTS,从aliveMembership存储移到deadMembership存储。
+
+调用d.comm.CloseConn(member2Expire)关闭到deadMember的链接
+
+### handlerMessages方法
+
+处理消息接受到的消息。首先调用d.comm.Accept获取传送消息的通道，然后针对不同的信号进行处理。如果是d.toDieChan的信号，将信号传送到d.toDieChan；如果是消息通道的信号，调用d.handleMsgFromCommc处理消息
+
+```golang
+in := d.comm.Accept()
+for !d.toDie() {
+	select {
+	case s:= <-d.toDieChan:
+		d.toDieChan <- s
+		return
+	case m := <- in:
+		d.handleMsgFromComm(m)
+	}
+}
+```
+
+### handleMsgFromComm方法
+
+处理消息。消息可能是Alive消息，或者是MembershipResponse消息，或者是MembershipRequest消息
+
+参数：
+
+- m *proto.SignedGossipMessage：收到的消息
+
+(1) 如果是MembershipRequest消息，将自身的信息创建一个Gossip消息，然后检查消息的有效性，如果有效调用d.handleAliveMessage处理消息。最后，新启线程，调用d.sendMemresponse发送消息
+
+```golang
+if memReq := m.GetMemReq(); memReq != nil {
+	selfInfoGossipMsg, err := memReq.SelfInformation.ToGossipMessage()
+	...
+	if d.msgStore.CheckValid(selfInfoGossipMsg) {
+		d.handleAliveMessage(selfInfoGossipMsg)
+	}
+
+	var internalEndpoint string
+	if m.Envelope.SecretEnvelope != nil {
+		internalEndpoint = m.Envelope.SecretEnvelope.InternalEndpoint()
+	}
+
+	go d.sendMemResponse(selfInfoGossipMsg.GetAliveMsg().Membership, internalEndpoint, m.Nonce)
+	return
+}
+```
+
+(2) 如果是AliveMsg，将消息添加到msgStore，调用handleAliveMessage处理消息，然后调用d.comm.Gossip广播消息。
+
+```golang
+if m.IsAliveMsg() {
+	if !d.msgStore.Add(m) {
+		return
+	}
+	d.handleAliveMessage(m)
+	d.comm.Gossip(m)
+	return
+}
+```
+
+(3) 如果是MemshipResponse消息，首先，将消息的Nonce分发出去；然后对于Alive消息，检查消息的有效性，调用d.handleAliveMessage处理消息；对于Dead消息，调用d.learnNewMembers处理
+
+```golang
+if memResp := m.GetMemRes(); memResp != nil {
+	d.pubsub.Publish(fmt.Sprintf("%d", m.nonce), m.Nonce)
+
+	for _,env := range memResp.Alive {
+		am, err := env.ToGossipMessage()
+		...
+		if d.msgStore.CheckValid(am) {
+			d.handleAliveMessage(am)
+		}
+	}
+
+	for _, env := range memResp.Dead {
+		dm, err := env.ToGossipMessage()
+		...
+		if !d.crypt.ValidateAliveMsg(dm) {
+			continue
+		}
+		if !d.msgStore.CheckValid(dm) {
+			return
+		}
+		newDeadMembers := []*proto.SignedGossipMessage{}
+		d.lock.RLock()
+		if _, known := d.id2Member[string(dm.GetAliveMsg().Membership.PkiId)]; !know {
+			newDeadMembers = append(newDeadMembers, dm)
+		}
+		d.lock.RUnlock()
+		d.learnNewMembers([]*proto.SignedGossipMessage{}, newDeadMembers)
+	}
+}
+```
+
+### handleAliveMessage方法
+
+处理Alive消息
+
+参数：
+
+- m *proto.SignedGossipMessage
+
+首先调用d.crypt.ValidateAliveMsg方法校验消息。
+
+如果收到消息的pkiID与解答自身的pkiID相同，比较消息和自身的InternalEndpoint或者ExternalEndpoint是否相同。
+
+```golang
+pkiID := m.GetAliveMsg().Membership.PkiId
+if equalPKIid(pkiID, d.self.PKIid) {
+	diffExternalEndpoint := d.self.Endpoint != m.GetAliveMsg().Membership.Endpoint
+	var diffExternalEndpoint bool
+	secretEnvelope := m.GetSecreteEnvelope()
+	if secretEnvelope != nil && secreteEnvelope.InteralEndpoint() != "" {
+		diffExternalEndpoint = secreateEnvelope.InternalEndpoint() != d.self.InternalEndpoint
+	}
+	if diffInternalEndpoint || diffExternalEndpoint {
+		d.logger.Error("...")
+	}
+	return
+}
+```
+
+如果不是自身，首先获取m.GetAliveMsg().Timestamp。查找id2Member,如果没找到，调用d.learnNewMembers方法处理。然后查找d.aliveLastTS和deadLastTS。如果在deadLastTS中，如果lastDeadTS在ts之前，调用d.resurrectMember恢复节点。如果在aliveLastTS中，如果lastAliveTS在ts之前，调用learnExistMembers进行处理
+
+### resurrectMember方法
+
+恢复dead节点
+
+参数：
+
+- am *proto.SignedGossipMessage
+- t proto.PeerTime
+
+首先，从消息重获取成员信息，新建pkiID到timestamp的映射
+
+```golang
+member := am.GetAliveMsg().Membership
+pkiID := memberPkiId
+d.aliveLastTS[string(pkiID)] = &timestamp {
+	lastSeen: time.Now(),
+	seqNum: t.SeqNum,
+	incTime: tsToTime(t.IncNum)
+}
+```
