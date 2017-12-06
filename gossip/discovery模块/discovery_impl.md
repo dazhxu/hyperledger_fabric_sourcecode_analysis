@@ -434,3 +434,314 @@ d.aliveLastTS[string(pkiID)] = &timestamp {
 	incTime: tsToTime(t.IncNum)
 }
 ```
+
+更新远端节点成员信息，从d.deadLastTS中删除节点的pki信息，并从deadMembership移到aliveMembership
+
+### learnNewMembers方法
+
+感知新的节点信息
+
+参数：
+
+- aliveMembers []*proto.SignedGossipMessage
+- deadMembers []*proto.SignedGossipMessage
+
+对于aliveMembers，如果am.GetAliveMsg().Membership.PkiId不是节点自身的，在aliveLastTS创建条目，并将其放入aliveMembership中；
+对于deadMembers，如果am.GetAliveMsg().Membership.PkiId不是节点自身的，在deadLastTS创建条目，并将其放入deadMembership中；
+
+无论在哪种情况下，都更新id2Member的信息
+
+### learnExistingMembers方法
+
+感知已存在的成员
+
+参数：
+
+- aliveArr []*proto.SignedGossipMessage
+
+对于aliveArr的每个元素，首先更新id2Member中的信息。如果消息中的成员在deadLastTS或不在aliveLastTS中，说明节点已经过期，进行下一个元素。否则，更新aliveLastTS存在的活性数据，如果aliveMembership中不存在，添加到其中；否则替换信息。
+
+### sendMemResponse方法
+
+发送成员回应信息
+
+参数：
+
+- targetMember *proto.Member
+- internalEndpoint string
+- nonce uint64
+
+首先，创建目标peer结构，然后调用createAliveMessage方法创建alive消息，接着调用createMembershipResponse方法创建回应；将回应打包成proto.SingedGossipMessage，然后调用d.comm.SendToPeer将消息发送出去
+
+```golang
+targetPeer := &NetworkMember{
+	Endpoint:			targetMember.Endpoint,
+	Metadata:			targetMember.Metadata,
+	PKIid:				targetMember.PkiId,
+	InternalEndpoint:	internalEndpoint,
+}
+aliveMsg, err := d.createAliveMessage(true)
+...
+memResp := d.createMembershipResponse(aliveMsg, targetPeer)
+if memResp == nil {
+	d.comm.CloseConn(targetPeer)
+	return
+}
+...
+msg, err := (&proto.GossipMessage{
+	Tag: 	proto.GossipMessage_EMPTY,
+	Nonce: 	nonce,
+	Content:&proto.GossipMessage_MemRes{
+		MemRes: memResp,
+	},
+}).NoopSign()
+...
+d.comm.SendToPeer(targetPeer, msg)
+```
+
+### createAliveMessage方法
+
+创建Alive消息
+
+参数：
+
+- includeInternalEndpoint bool
+
+返回值：
+
+- *proto.SignedGossipMessage
+- error
+
+根据d.self的信息创建GossipMessage，然后调用d.crypt.SignMessage对消息进行签名，并打包成proto.SignedGossipMessage消息
+
+### createMembershipResponse
+
+创建MembershipResponse
+
+参数：
+
+- aliveMsg *proto.SignedGossipMessage
+- targetMember *NetworkMember
+
+返回值：
+
+- *proto.MembershipResponse
+
+调用d.disclosurePolicy判断是否应该被关闭。获取deadPeer和alivePeer
+
+```golang
+shouldBeDisclosed, omitConcealedFields := d.disclosurePolicy(targetMember)
+
+if !shouldBeDisclosed(aliveMsg) {
+	return nil
+}
+...
+deadPeers := []*proto.Envelope{}
+for _, dm := range d.deadMembership.ToSlice() {
+	if !shouldBeDisclosed(dm) {
+		continue
+	}
+	deadPeers = append(deadPeers, omitConcealedFields(dm))
+}
+
+var aliveSnapshot []*proto.Envolope
+for _, am := range d.aliveMembership.ToSlice() {
+	if !shouldBeDisclosed(am) {
+		continue
+	}
+	aliveSnapshot = append(aliveSnapshot, omitConcealedFields(am))
+}
+
+return &proto.MembershipResponse{
+	Alive: append(aliveSnapshot, omitConcealedFields(aliveMsg)),
+	Dead: deadPeers,
+}
+```
+
+### periodicalReconnectToDead方法
+
+周期性地连接dead节点。
+
+对于deadLastTS中的每个节点，新启一个线程，检查可达性。如果Ping通，调用d.sendMembershipRequest方法，否则返回。
+
+```golang
+for !d.toDie() {
+	wg := &sync.WaitGroup{}
+
+	for _, member := range d.copyLastSeen(d.deadLastTS) {
+		wg.Add(1)
+		go func(member NetworkMember) {
+			defer wg.Done()
+			if d.comm.Ping(&member) {
+				d.sendMembershipRequest(&member, true)
+			} else {
+				d.logger.Debug(member, "is still dead")
+			}
+		} (member)
+	}
+
+	wg.Wait()
+	time.Sleep(getReconnectInterval())
+}
+```
+
+### sendMembershipRequest方法
+
+发送成员信息请求消息。
+
+参数：
+
+- member *NetworkMember
+- includeInternalEndpoint bool
+
+调用d.createMembershipRequest方法创建消息，然后调用d.comm.SendToPeer将请求发送
+
+```golang
+m, err := d.createMembershipRequest(includeInternalEndpoint)
+...
+req, err := m.NoopSign()
+...
+d.comm.SendToPeer(member, req)
+```
+
+### createMembershipRequest方法
+
+创建Membership请求
+
+首先，调用createAliveMessage消息。然后创建proto.MembershipRequest方法，其中Known字段设置为空字节，以防远端节点不该知道其他节点信息。返回proto.GossipMessage消息
+
+```golang
+am, err := d.createAliveMessage(includeInternalEndpoint)
+...
+req := &proto.MembershipRequest{
+	SelfInfomation: am.Envelope,
+	Known: [][]byte{},
+}
+return &proto.GossipMessage{
+	Tag: proto.GossipMessage_EMPTY,
+	Nonce: uint64(0),
+	Content: &proto.GossipMessage_MemReq{
+		MemReq: req,
+	},
+}, nil
+```
+
+### copyLastSeen方法
+
+从id2Member中收集lastSeen节点的Member信息
+
+```golang
+res := []NetworkMember{}
+for pkiIDStr := range lastSeenMap {
+	res = append(res, *(d.id2Member[pkiIDStr]))
+}
+return res
+```
+
+### handlePresumedDeadPeers方法
+
+处理被认为是dead的节点。
+
+对于d.comm.PresumedDead()通道的信号，调用d.isAlive方法，如果判断为真，调用d.expireDeadMembers方法失效节点；
+对于d.toDieChan的信号，发送信号到d.toDieChan
+
+```golang
+for !d.toDie() {
+	select {
+	case deadPeer := <-d.comm.PresumedDead():
+		if d.isAlive(deadPeer) {
+			d.expireDeadMembers([]common.PKIidType{deadPeer})
+		}
+	case s := <-d.toDieChan:
+		d.toDieChan <- s
+		return
+ 	}
+}
+```
+
+### isAlive方法
+
+从d.aliveLastTS中查询节点是否存活。
+
+### Lookup方法
+
+从id2Member中查询PKIid对应的NetworkMember
+
+### Connect方法
+
+不停的重试连接远端节点。
+
+参数：
+
+- member NetworkMember
+- id identifier
+
+如果member是自身，直接返回。
+
+新启线程，进行尝试重连。每次重连首先调用d.createMembershipRequest方法创建成员信息请求，并调用util.RandomUint64为请求消息创建一个Nonce，最后新启线程调用d.sendUntilAcked方法发送请求
+
+### sendUntilAcked方法
+
+尝试发送消息，直到确认
+
+参数：
+
+- peer *NetworkMember:
+- message *proto.SignedGossipMessage
+
+创建一个topic为nonce的订阅，将message发送到peer，如果没有超时，直接返回；否则等待一段时间，重新发送
+
+```golang
+nonce := message.Nonce
+for i := 0; i < maxConnectionAttempts && !d.toDie(); i++ {
+	sub := d.pubsub.Subscribe(fmt.Sprintf("%d",nonce), time.Seconde*5)
+	if _, timeoutErr := sub.Listen(); timeoutErr == nil {
+		return
+	}
+	time.Sleep(getReconnectInterval())
+}
+```
+
+### InitiateSync方法
+
+初始化同步，在aliveMembership中随机选择min(peerNum, d.aliveMembership.Size())个节点，发送membershiprequest
+
+### GetMembership方法
+
+从aliveMembership中获取成员信息
+
+返回值：
+
+- []NetworkMember
+
+```golang
+response := []NetworkMember{}
+for _, m := range d.aliveMembership.ToSlice() {
+	member := m.GetAliveMsg()
+	response = append(response, NetworkMember{
+		PKIid: 				member.Membership.PkiId,
+		Endpoint: 			member.Membership.Endpoint,
+		Metadata: 			member.Membership.Metadata,
+		InternalEndpoint: 	d.id2Member[string(m.GetAliveMsg).Membership.PkiId].InternalEndpoint,
+	})
+}
+return response
+```
+
+### UpdateMetadata方法
+
+更新metadata
+
+### UpdataEndpoint方法
+
+更新endpoint
+
+### Self方法
+
+返回自身的NetworkMember
+
+### Stop方法
+
+停止discoveryImpl对象。
+
+首先设置d.toDieFlag为1，然后调用d.msgStore.Stop()停止msgStore，最后想d.toDieChan中发送一个空对象
