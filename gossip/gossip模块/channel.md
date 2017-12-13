@@ -336,5 +336,168 @@ ConfigChannel在channel中配置合法的组织的列表
 
 ### requestStateInfo方法
 
+请求stateInfo。首先调用gc.createStateInfoRequest方法，创建stateInfo请求消息；然后调用filter.SelectPeers(gc.GetConf().PullPeerNum, gc.GetMembership(), gc.IsMemberInChan)选取请求的节点；最后，调用gc.Send(req, endpoints...)将请求发送出去
 
+### createStateInfoRequest方法
 
+创建stateInfo请求
+
+```golang
+return (&proto.GossipMessage{
+	Tag: proto.GossipMessage_CHAN_OR_ORG,
+	Nonce: 0,
+	Content: &proto.GossipMessage_StateInfoPullReq{
+		StateInfoPullReq: &proto.StateInfoPullRequest{
+			Channel_MAC: GenerateMAC(gc.pkiID, gc.chainID),
+		},
+	},
+}).NoopSign()
+```
+
+### IsMemberInChan方法
+
+检查给定的member是否在channel中
+
+参数：
+
+- member discovery.NetworkMember
+
+返回值：
+
+- bool
+
+首先根据member获取org的ID，org := gc.GetOrgOfPeer(member.PKIid)；然后，返回gc.IsOrgInChannel(org)。
+
+### IsOrgInChannel方法
+
+返回给定的org是否在channel中
+
+参数：
+
+- membersOrg api.OrgIdentityType
+
+返回值：
+
+- bool
+
+对于gc.orgs中的org，如果存在org与membersOrg相同，返回true；否则返回false
+
+### eligibleForChannelAndSameOrg方法
+
+memeber是否在通道里并是自身org
+
+参数：
+
+- member discovery.NetworkMember：成员
+
+返回值：
+
+- bool
+
+首先定义是否是同一个org
+
+```golang
+sameOrg := func(networkMember discovery.NetworkMember) bool {
+	return bytes.Equal(gc.GetOrgOfPeer(networkMember.PKIid), gc.selfOrg)
+}
+```
+
+返回member是否是在通道中，并且是同一个组织
+
+```golang
+return filter.CombineRoutingFilters(gc.EligibleForChannel, sameOrg)(member)
+```
+
+### publishStateInfo方法
+
+将stateInfo消息进行分发。首先获取gc.stateInfoMsg；然后调用gc.Gossip(stateInfoMsg)将其分发出去
+
+### EligibleForChannel方法
+
+返回给定的member是否有权限从channel中获取区块。首先，获取身份和msg；然后调用gc.mcs.VerifyByChannel验证签名
+
+```golang
+identity := gc.GetIdentityByPkIID(member.PKIid)
+msg := gc.stateInfoMsgStore.MsgByID(mkember.PKIid)
+...
+return gc.mcs.VerifyByChannel(gc.chainID, identity, msg.Envelope.Signature, msg.Envelope.Payload) == nil
+```
+
+### AddToMsgStore方法
+
+将给定的GossipMessage添加到message store。如果是消息是IsDataMsg()，调用gc.blockMsgStore.Add(msg)和gc.blocksPuller.Add(msg)添加消息；如果消息IsStateInfoMsg, 调用gc.stateInfoMsgStore.Add(mgs)添加消息
+
+### HandlerMessage方法
+
+处理远端节点发送过来的消息
+
+参数：
+
+- msg proto.ReceivedMessage
+
+首先，调用gc.verifyMsg(msg)验证消息；如果消息不是!m.IsChannelRestricted()，直接返回；
+
+然后通过msg获取orgID，并判断org是否在channel中
+
+```golang
+orgID := gc.GetOrgOfPeer(msg.GetConnectionInfo().ID)
+if len(orgID) == 0 {
+	return
+}
+if !gc.IsOrgInChannel(orgID) {
+	return
+}
+```
+
+如果消息IsStateInfoPullRequestMsg，调用msg.Respond(gc.createStateInfoSnapshot(orgID))回应消息，并返回。
+
+如果消息IsStateInfoSnapShot，调用gc.handleStateInfSnapshot处理snapshot，并返回。
+
+如果消息IsDataMsg，如果m.GetDataMsg().Payload为空，直接返回；否则，调用gc.blockMsgStore.CheckValid(msg.GetGossipMessage())检查区块是否可以进入msgstore，然后调用gc.veryfyBlock(m.GossipMessage, msg.GetConnectionInfo().ID)校验消息。然后将消息添加到gc.blockMsgStore。如果添加成功，则调用gc.Gossip()转发消息，并调用gc.DeMultiplex()分用消息到本地的subscribers，最后将消息添加到gc.blocksPuller
+
+如果消息IsStateInfoMsg, 将消息添加到gc.stateInfoMsgStore，如果添加成功，则调用gc.Gossip()转发消息，并调用gc.DeMultiplex()分用消息到本地的subscribers。
+
+如果消息IsPullMsg，并且m.GetPullMsgType()==proto.PullMsgType_BLOCK_MSG。如果gc.stateInfoMsgStore.MsgByID(msg.GetConnectionInfo().ID)为空，说明没有此节点的stateInfo信息，直接返回。否则，如果！eligibleForChannelAndSameOrg，说明没有权限从chain中获取区块，返回。如果m.IsDataUpdate(), 遍历envelopes，过滤掉已经在blockMsgStore的区块，和离现在太远的区块。最后调用gc.blocksPuller.HandleMessage(msg)处理消息。
+
+如果消息IsLeadershipMsg(),将消息添加到gc.leaderMsgStore。如果添加成功，调用gc.DeMultiplex(m)分用消息。
+
+### handleStateInfSnapshot方法
+
+处理stateInfoSnapShot。
+
+对于m.GetStateSnapshot().Elements中的每个条目，首先将其转换成Gossip消息，然后获取stateInfo及orgID。判断orgID是否在通道中。判断收到的消息的MAC和期望的MAc是否相同。调用gc.ValidateStateInfoMessage(stateInf)，校验消息。然后调用gc.Lockup(si.PkiId),如果查找成功，将stateInf添加到gc.stateInfoMsgStore
+
+### verifyBlock消息
+
+验证区块。
+
+首先获取payload := msg.GetDataMsg().Payload，然后根据payload获取其SeqNum和Data，调用gc.mcs.VerifyBlock(msg.Channel, seqNum, rawBlock)验证区块。
+
+### createStateInfoSnapshot方法
+
+创建stateInfoSnapshot。
+
+首先调用gc.stateInfoMsgStore.Get()方法获取stateInfoMsgStore中的所有条目。对于每个条目，获取其SignedGossipMessage, 并获取天条目的orgID，如果请求者是和节点在同一个组织，或者消息属于外部的组织，不做处理；否则，如果gc.Lookup(msg.GetStateInfo().PkiId)能找到，将条目添加到elements中
+
+创建GossipMessage消息
+
+```golang
+return &proto.GossipMessage{
+	Channel: gc.chainID,
+	Tag:     proto.GossipMessage_CHAN_OR_ORG,
+	Nonce:   0,
+	Content: &proto.GossipMessage_StateSnapshot{
+		StateSnapshot: &proto.StateInfoSnapshot{
+			Elements: elements,
+		},
+	},
+}
+```
+
+### verifyMsg方法
+
+验证消息。比较消息的MAC与预期的MAC是否相同.
+
+### UpdataStateInfo方法
+
+将消息添加到gc.stateInfoMsgStore，并设置gc.stateInfoMsg=msg
