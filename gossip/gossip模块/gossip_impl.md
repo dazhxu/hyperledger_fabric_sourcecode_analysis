@@ -460,4 +460,319 @@ go g.acceptMessages(incMsgs)
 
 ### validateLeadershipMessage方法
 
-首先调用msg.GetLeadershipMsg().PkiId获取pkiid，然后
+首先调用msg.GetLeadershipMsg().PkiId获取pkiid，然后从g.idMapper中获取对应的identity，然后调用msg的Verify方法校验消息和身份
+
+```golang
+msg.Verify(identity, func(peerIdentity []byte, signature, message []byte) error{
+	return g.mcs.Verify(identity, signature, message)
+})
+```
+
+### selectOnlyDiscoveryMessage方法
+
+选择discovery消息，即alive消息，request消息和response消息。
+
+### forwardDiscoveryMsg方法
+
+转发消息。将msg.GetGossipMessage发送到g.discAdapter.incChan中
+
+### periodicalIdentityValidationAndExpiration方法
+
+周期性地检查失效节点和活跃节点的身份。
+
+```golang
+go g.periodicalIdentityValidation(func(identity api.PeerIdentityType) bool{
+	return true
+}, identityExpirationCheckInterval)
+
+go g.periodicalIdentityValidation(fucn(identity api.PeerIdentityType) bool {
+	return false
+}, identityInactivityCheckInterval)
+```
+
+### periodicalIdentityValidation方法
+
+对于g.toDieChan中的信号，将其发送到g.toDieChan通道中，并返回；如果time.Afer(interval)的信号，调用g.SuspectPeers(suspectFunc)方法
+
+### SuspectPeers方法
+
+是gossip实例校验suspected节点，并关闭到无效身份的连接
+
+```golang
+for _, pkiID := range g.certStore.listRevokedPeers(isSuspected) {
+	g.comm.CloseConn(&comm.RemotePeer{PKIID: pkiID})
+}
+```
+
+### connect2BootstrapPeers方法
+
+连接到bootstrap节点
+
+对于g.conf.BootstrapPeers中的endpoint, 创建identitier。
+
+```golang
+identifier := func() (*discovery.PeerIdentification, error) {
+	remotePeerIdentity, err := g.comm.Handshake(&comm.RemotePeer{Endpoint: endpoint})
+	...
+	sameOrg := bytes.Equal(g.selfOrg, g.secAdvisor.OrgByPeerIdentity(remotePeerIdentity))
+	if !sameOrg {
+		return nil, fmt.Errorf("...")
+	}
+	pkiID := g.mcs.GetPKIidOfCert(remotePeerIdentity)
+	if len(pkiID) == 0 {
+		return nil, fmt,Errorf("...")
+	}
+	return &discovery.PeerIdentification{ID: pkiID, selfOrg: sameOrg}, nil
+}
+```
+
+最后创建到bootstrap的连接
+
+```golang
+g.disc.Connect(discovery.NetworkMember{
+	InternalEndpoint: endpoint,
+	Endpoint: endpoint,
+}, identifier)
+```
+
+### selfNetworkMember方法
+
+返回自身的networkmember对象
+
+```golang
+self := discovery.NetworkMember{
+	Endpoint: g.conf.ExternalEndpoint,
+	PKIid: g.comm.GetPkiid(),
+	Metadata: []byte{},
+	InternalEndpoint: g.conf.InternalEndpoint,
+}
+if g.disc != nil {
+	self.Metadata = g.disc.Self().Metadata
+}
+return self
+```
+
+### JoinChan方法
+
+加入通道
+
+参数：
+
+- joinMsg api.JoinChannelMessage
+- chainID common.ChainID
+
+首先调用g.chanState.joinChannel(joinMsg, chainID)方法加入channel。
+
+对于joinMsg.Members的每个org，调用g.learnAnchorPeers(org, joinMsg.AnchorPeersOf(org))获得anchor peer
+
+### learnAnchorPeers方法
+
+连接到anchorpeer
+
+参数：
+
+- orgOfAnchorPeers api.OrgIdentityType
+- anchorPers []api.AnchorPeer
+
+首先对于anchorPeers中的节点，首先校验host和port是否合法，并跳过自身。
+
+如果peer不是自己组织的且自己的endpoint为空，则continue。
+
+创建identifier
+
+```golang
+identifier := func() (*discovery.PeerIdentificaiton, error){
+	remotePeerIdentity, err := g.comm.Handshake(&comm.RemotePeer{Endpoint: endpoint})
+	...
+	isAnchorPeerInMyOrg := bytes.Equal(g.selfOrg, g.secAdvisor.OrgByPeerIdentity(remotePeerIdentity))
+	if bytes.Equal(orgOfAnchorPeers, g.selfOrg) && !isAnchorPeerInMyOrg{
+		//不是自己的组织，但其声称是
+		return nil, errors.New(err)
+	}
+	pkiID := g.mcs.GetPKIidOfCert(remotePeerIdentity)
+	...
+	return &discovery.PeerIdentification{
+		ID: pkiID,
+		SelfOrg: isAnchorPeerInMyOrg
+	}, nil
+
+}
+```
+
+最后连接到anchor peer
+
+```golang
+g.disc.Connect(discovery.NetworkMember{
+	InternalEndpoint: endpoint,
+	Endpoint: endpoint,
+}, identifier)
+```
+
+### sendGossipBatch方法
+
+发送gossip的batch消息
+
+参数：
+
+- a []interface{}
+
+创建要发送的消息，并调用g.gossipBatch(msgsGossip)发送
+
+### gossipBatch方法
+
+决定发送消息到那些节点。
+
+为了效率，将拥有相同路由策略的消息一起发送，然后发送下一组消息。例如，发送所有通道C的区块当同一组peer，发送所有StateInfo消息到同一组peer。当发送区块时，只发送到那些在通道中广播了自己的节点；当发送StateInfo消息是，发送到通道中的节点；当发送标记着只能被在组织内发送，那么发送所有消息到同一组peer。其他没有限制的消息，发送到任意节点组。
+
+参数：
+
+- msgs []*proto.SignedGossipMessage
+
+首先创建消息判断函数
+
+```golang
+isABlock := func(o insterface{}) bool {
+	return o.(*proto.SignedGossipMessage).IsDataMsg()
+}
+isAStateInfoMsg := func(o interface{}) bool {
+	return 0.(*proto.SignedGossipMessage).IsStateInfoMsg()
+}
+aliveMsgsWithNoEndpointAndInOurOrg := func(o interface{}) bool {
+	msg := o.(*proto.SignedGossipMessage)
+	if !msg.IsAliveMsg{
+		return false
+	}
+	member := msg.GetAliveMsg().Membership
+	return member.Endpoint == "" && g.isInMyorg(discovery.NetworkMember{PKIid: member.PkiId})
+}
+isOrgRestricted := func(o interface{}) bool {
+	return aliveMsgsWithNoEndpointAndInOurOrg(o) || o.(*proto.SignedGossipMessage).IsOrgRestricted()
+}
+isLeadershipMsg := func(o interface{}) bool {
+	return o.(*proto.SignedGossipMessage).IsLeadershipMsg()
+}
+```
+
+调用partitionMessages方法对消息进行分类。
+
+- gossip区块
+
+```golang
+blocks, msgs = partitionMessages(isABlock, msgs)
+g.gossipInChan(blocks, func(gc channel.GossipChannel) filter.RoutingFilter {
+	return filter.CombineRoutingFilters(gc.EligibleForChannel, gc.IsMemberInChan, g.isInMyorg)
+})
+```
+
+- gossip Leadership消息
+
+```golang
+leadershipMsgs, msgs = partitionMessages(isLeadershipMsg, msgs)
+g.gossipInChan(leadershipMsgs, func(gc channel.GossipChannel) filter.RoutingFilter {
+	return filter.CombineRoutingFilters(gc.EligibleForChannel, gc.IsMemberInChan, g.isInMyorg)
+})
+```
+
+- gossip stateInfo消息
+
+```golang
+stateInfoMsgs, msgs = partitionMessages(isAStateInfoMsg, msgs)
+for _, stateInfMsg := range stateInfoMsgs {
+	peerSelector := g.isInMyorg
+	gc := g.chanState.lookupChannelForGossipMsg(stateInfMsg.GossipMessage)
+	if gc != nil && g.hasExternalEndpoint(stateInfMsg.GossipMessage.GetStateInfo().PkiId) {
+		peerSelector = gc.IsMemberInChan
+	}
+	peers2Send := filter.SelectPeers(g.conf.PropagatePeerNum, g.disc.GetMembership(), peerSelector)
+	g.comm.Send(stateInfMsg, peers2Send...)
+}
+```
+
+- gossip限制组织的消息
+
+```golang
+orgMsgs, msgs = partitionMessages(isOrgRestricted, msgs)
+peers2Send := filter.SelectPeers(g.conf.PropagatePeerNum, g.disc.GetMembership(), g.isInMyorg)
+for _, msg := range orgMsgs {
+	g.comm.Send(msg, peers2Send...)
+}
+```
+
+- gossip其他消息
+
+```golang
+for _, msg := range msgs {
+	if !msg.IsAliveMsg() {
+		g.logger.Error("Unknown message type", msg)
+		continue
+	}
+	selectByOriginOrg := g.peersByOriginOrgPolicy(discovery.NetworkMember{PKIid: msg.GetAliveMsg().Membership.PkiId})
+	peers2Send := filter.SelectPeers(g.conf.PropagatePeerNum, g.disc.GetMembership(), selectByOriginOrg)
+	g.sendAndFilterSecrets(msg, peers2Send...)
+}
+```
+
+### partitionMessages方法
+
+区分消息
+
+参数：
+
+- pred common.MessageAcceptor
+- a []*proto.SignedGossipMessage
+
+返回值：
+
+- []*proto.SignedGossipMessage
+- []*proto.SignedGossipMessage
+
+如果满足pred条件，添加到s1中；否则，添加到s2中。返回s1和s2
+
+### gossipInChan方法
+
+根据channel的routing policy发送Gossip消息块
+
+参数：
+
+- messages []*proto.SignedGossipMessage
+- chanRoutingFactory channelRoutingFilterFactory
+
+调用extractChannels(messages)从消息中获取所有的channel，然后针对每个channel将消息进行区分，调用g.comm.Send方法发送消息
+
+### extractChannels方法
+
+从消息中获取所有channel
+
+针对每个消息，获取其channel，收集到一起
+
+### hasExternalEndpoint方法
+
+返回g.disc.Lookup(PKIID).Endpoint != ""
+
+### peersByOriginOrgPolicy方法
+
+首先通过peer.PKIid获取peersOrg，如果是自己的组织，返回filter.SelectAllPolicy。否则，返回选择来源组织的节点和自己组织的节点
+
+```golang
+return func(member discovery.NetworkMember) bool {
+	memberOrg := g.getOrgOfPeer(member.PKIid)
+	if len(memberOrg) == 0 {
+		return false
+	}
+	isFromMyOrg := bytes.Equal(g.selfOrg, memberOrg)
+	return isFromMyOrg || bytes.Equal(memberOrg, peersOrg)
+}
+```
+
+### sendAndFilterSecrets方法
+
+对于peer中的每个消息，不要转发外部组织的alive消息到没有外部endpoint的节点。将msg.Envelope.SecretEnvelope设置为nil，调用g.comm.Send发送消息。
+
+### Gossip方法
+
+gossip消息
+
+参数：
+
+- msg *proto.GossipMessage
+
