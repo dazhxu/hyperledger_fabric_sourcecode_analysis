@@ -358,6 +358,8 @@ g.certStore = newCertStore(g.createCertStorePuller(), idMapper, )
 
 最后，新启goroutine，调用g.start()开始gossip服务；新启goroutine，调用g.periodocalValidationAndExpiration()定期进行验证和失效工作；新启go routine，调用g.connect2BootstrpPeers()连接到bootstrap节点
 
+## 普通方法
+
 ### createCommWithServer方法
 
 创建一个comm层的server
@@ -387,6 +389,77 @@ g.certStore = newCertStore(g.createCertStorePuller(), idMapper, )
 ### newChannelState方法
 
 此方法是gossip_impl模块的全局方法，目的是创建一个channelState
+
+### createCertStorePuller方法
+
+创建新的pullMediator实例。
+
+首先创建pull.Config
+
+```golang
+conf := pull.Config{
+	MsgType:           proto.PullMsgType_IDENTITY_MSG,
+	Channel:           []byte(""),
+	ID:                g.conf.InternalEndpoint,
+	PeerCountToSelect: g.conf.PullPeerNum,
+	PullInterval:      g.conf.PullInterval,
+	Tag:               proto.GossipMessage_EMPTY,
+}
+```
+
+创建从消息中获取pkiID的函数pkiIDFromMsg；创建certConsumer方法，从消息中获取identity，放入g.idMapper。
+
+创建PullAdapter
+
+```golang
+adapter := &pull.PullAdapter{
+	Sndr: g.comm,
+	MemSvc: g.disc,
+	IdExtractor: pkiIDFromMsg,
+	MsgCons: certConsumer,
+	DigFilter: g.sameOrgOrOurPullFilter,
+}
+```
+
+创建pullMediator并返回
+
+```golang
+return pull.NewPullMediator(conf, adapter)
+```
+
+### sameOrgOrOurOrgPullFilter方法
+
+如果peer是本组织的，gossip所有的身份
+
+```golang
+peersOrg := g.secAdvisor.OrgByPeerIdentity(msg.GetConnectionInfo().Identity)
+...
+if bytes.Equal(g.selfOrg, peersOrg) {
+	return func(_ string) bool {
+		return true
+	}
+}
+```
+
+否则返回不是本组织
+
+```golang
+return func(item string) bool {
+	pkiID := common.PKIidType(item)
+	msgsOrg := g.getOrgOfPeer(pkiID)
+	if len(msgsOrg) == 0 {
+		g.logger.Warning("Failed determining organization of", pkiID)
+		return false
+	}
+	// Don't gossip identities of dead peers or of peers
+	// without external endpoints, to peers of foreign organizations.
+	if !g.hasExternalEndpoint(pkiID) {
+		return false
+	}
+	// Peer from our org or identity from our org or identity from peer's org
+	return bytes.Equal(msgsOrg, g.selfOrg) || bytes.Equal(msgsOrg, peersOrg)
+}
+```
 
 ### start方法
 
@@ -468,7 +541,7 @@ msg.Verify(identity, func(peerIdentity []byte, signature, message []byte) error{
 })
 ```
 
-### selectOnlyDiscoveryMessage方法
+### selectOnlyDiscoveryMessages方法
 
 选择discovery消息，即alive消息，request消息和response消息。
 
@@ -776,3 +849,157 @@ gossip消息
 
 - msg *proto.GossipMessage
 
+如果是数据消息，不对消息进行签名；否则，调用g.mcs.Sign(msg)对消息进行签名
+
+如果消息IsChannelRestricted，调用g.chanState.getGossipChannelByChainID(msg.Channel)获取通道，如果msg是数据消息，调用gc.AddToMsgStore将其添加到消息存储。
+
+如果，g.conf.PropagateIterations为0，直接返回。否则，调用g.emitter.Add(sMsg)发送消息
+
+### Send方法
+
+发送消息到远端节点
+
+参数：
+
+- msg *proto.GossipMessage
+- peers ...*comm.RemotePeer
+
+调用g.comm.Send(m, peers...)发送消息
+
+### Peers方法
+
+返回discovery.NetworkMember的列表
+
+### PeersOfChannel方法
+
+返回存活的且是订阅到给定通道的节点
+
+### Stop方法
+
+停止gossip组件
+
+### UpdateMetadata方法
+
+调用g.disc.UpdateMetadata(md)更新元信息
+
+### UpdateChannelMetadata方法
+
+更新分发到其他节点的、与通道相关的状态的节点自身的元信息
+
+参数：
+
+- md []byte
+- chainID commom.ChainID
+
+首先，调用g.chanState.getGossipChannelByChainID获取通道，然后调用g.createStateInfoMsg创建StateInfo消息，返回调用gc.UpdateStateInfo(stateInfMsg)更新元信息
+
+### Accept方法
+
+返回一个专用的只读通道，传输那些由其他节点发来的、满足特定条件的消息。
+
+参数：
+
+- acceptor commom.MessageAcceptor
+- passThrough bool
+
+返回值：
+
+- <-chan *proto.GossipMessage
+- <-chan proto.ReceivedMessage
+
+如果passThrough为真，gossip层不做处理，直接返回nil, g.comm.Acceptor.
+
+否则，创建根据类型接受消息函数
+
+```golang
+acceptByType := func(o interface{}) bool {
+	if o, isGossipMsg := o.(*proto.GossipMessage); isGossipMsg {
+		return acceptor(o)
+	}
+	if o, isSignedMsg := o.(*proto.SignedGossipMessage); isSignedMsg {
+		sMsg := o
+		return acceptor(sMsg.GossipMessage)
+	}
+	return false
+}
+```
+
+将aceptByType注册到channel中，返回通道inCh；创建outCh传送proto.GossipMessage。
+
+新建go routine，处理信号。如果是g.toDieChan的信号，将其发送到g.toDieChan中，并返回；如果是inCh中的信号，将其转换为GossipMessage发送到outCh中。返回outCh,nil
+
+### createStateInfoMsg方法
+
+创建stateInfo消息
+
+参数：
+
+- metadata []byte
+- chainID common.ChainID
+
+返回值：
+
+- *proto.SignedGossipMessage
+- error
+
+### disclosurePolicy方法
+
+关闭策略
+
+参数：
+
+- remotePeer *discovery.NetworkMember
+
+返回值：
+
+- discovery.Sieve
+- discovery.EnvlopeFilter
+
+首先根据remotePeer.PKIid调用g.getOrgOfPeer获取remotePeerOrg。如果remotePeerOrg为空，返回
+
+```golang
+if len(remotePeerOrg) == 0 {
+	g.logger.Warning("Cannot determine organization of", remotePeer)
+	return func(msg *proto.SignedGossipMessage) bool {
+			return false
+		}, func(msg *proto.SignedGossipMessage) *proto.Envelope {
+			return msg.Envelope
+		}
+}
+```
+
+否则，创建Sieve函数和EnvelopeFilter函数。
+
+```golang
+return func(msg *proto.SignedGossipMessage) bool {
+	if !msg.IsAliveMsg() {
+		g.logger.Panic("Programming error, this should be used only on alive messages")
+	}
+	org := g.getOrgOfPeer(msg.GetAliveMsg().Membership.PkiId)
+		if len(org) == 0 {
+			g.logger.Warning("Unable to determine org of message", msg.GossipMessage)
+			// Don't disseminate messages who's origin org is unknown
+			return false
+		}
+
+		// Target org and the message are from the same org
+		fromSameForeignOrg := bytes.Equal(remotePeerOrg, org)
+		// The message is from my org
+		fromMyOrg := bytes.Equal(g.selfOrg, org)
+		// Forward to target org only messages from our org, or from the target org itself.
+		if !(fromSameForeignOrg || fromMyOrg) {
+			return false
+		}
+
+		// Pass the alive message only if the alive message is in the same org as the remote peer
+		// or the message has an external endpoint, and the remote peer also has one
+		return bytes.Equal(org, remotePeerOrg) || msg.GetAliveMsg().Membership.Endpoint != "" && remotePeer.Endpoint != ""
+	}, func(msg *proto.SignedGossipMessage) *proto.Envelope {
+		if !bytes.Equal(g.selfOrg, remotePeerOrg) {
+			msg.SecretEnvelope = nil
+		}
+		return msg.Envelope
+	}
+```
+
+### peerByOriginOrgPolicy
